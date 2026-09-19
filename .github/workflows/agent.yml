@@ -64,7 +64,9 @@ jobs:
           echo "SORCAR=$SORCAR" >> "$GITHUB_ENV"
           echo "::notice::sorcar binary: $SORCAR"
           python -c "import kiss, kiss.agents.sorcar.sorcar_agent as m; print('kiss import OK, main:', callable(m.main))"
-          python -m pip show kiss-agent-framework | head -4
+          # `|| true`: with `set -o pipefail` the SIGPIPE from `head` fails the
+          # step (exit 120) even though the command itself succeeded.
+          python -m pip show kiss-agent-framework 2>/dev/null | head -4 || true
 
       - name: Run agent task
         env:
