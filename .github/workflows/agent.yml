@@ -1,0 +1,121 @@
+name: KISS Sorcar Agent
+
+# KISS Sorcar (ksenxx/kiss_ai) running headlessly on GitHub Actions.
+#
+# `sorcar -t "<task>"` runs a task without the kiss-web daemon. Piped stdout
+# gets exactly the raw YAML result, and the process exits 0 on success / 1
+# otherwise, so CI can read the outcome directly.
+#
+# Model: glm-4.5-flash on Z.AI. Its entry in the framework's bundled
+# MODEL_INFO.json carries input_price_per_1M = 0 and output_price_per_1M = 0,
+# so the free tier is also zero-cost inside the framework's budget accounting.
+# An unknown model name would raise "Cannot calculate budget for unknown model",
+# which is why the model must come from the catalog.
+
+on:
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+    inputs:
+      task:
+        description: "Task for the agent. Leave empty for the default review task."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: kiss-sorcar-agent
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install KISS Sorcar
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet --upgrade pip
+          python -m pip install --quiet pipx
+          python -m pipx install kiss-agent-framework
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/sorcar" --help 2>&1 | head -20
+
+      - name: Run agent task
+        env:
+          TASK: ${{ github.event.inputs.task }}
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+        run: |
+          set -uo pipefail
+          DEFAULT_TASK='Read README.md in this repository and summarise in plain text, under 500 characters, what this repository does and one concrete improvement you would make. No code blocks.'
+          T="${TASK:-$DEFAULT_TASK}"
+          echo "::notice::task: $T"
+
+          sorcar -m glm-4.5-flash --work-dir "$GITHUB_WORKSPACE" -t "$T" > /tmp/raw.txt 2>/tmp/err.txt
+          rc=$?
+          echo "sorcar_exit=$rc" | tee /tmp/exit.txt
+          echo "::notice::sorcar exit code: $rc"
+          echo "--- stderr tail ---"; tail -20 /tmp/err.txt || true
+
+          python3 scripts/render_result.py /tmp/raw.txt > /tmp/clean.txt
+          echo "--- rendered ($(wc -c < /tmp/clean.txt) bytes) ---"
+          head -c 1200 /tmp/clean.txt; echo
+
+      - name: Save result
+        if: always()
+        env:
+          TASK: ${{ github.event.inputs.task }}
+        run: |
+          set -euo pipefail
+          mkdir -p runs
+          STAMP="$(date -u +%Y-%m-%dT%H-%M-%SZ)"
+          {
+            echo "# KISS Sorcar run — ${STAMP}"
+            echo
+            echo "Model: \`glm-4.5-flash\` (Z.AI free tier)"
+            echo
+            echo "Task: ${TASK:-default review task}"
+            echo
+            echo '```'
+            cat /tmp/clean.txt 2>/dev/null || echo "(no output)"
+            echo '```'
+          } > "runs/${STAMP}.md"
+          ls runs/ | tail -3
+
+      - name: Send result to Telegram
+        if: always()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set -uo pipefail
+          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+            echo "::warning::telegram secrets missing - skipping notify"
+            exit 0
+          fi
+          python3 scripts/notify.py /tmp/clean.txt "KISS Sorcar" || true
+
+      - name: Commit result
+        if: always()
+        run: |
+          set -uo pipefail
+          git config user.name  "kiss-sorcar-agent[bot]"
+          git config user.email "kiss-sorcar-agent@users.noreply.github.com"
+          if [ -z "$(git status --porcelain runs/ 2>/dev/null)" ]; then
+            echo "nothing to commit"; exit 0
+          fi
+          git add -f runs/
+          git commit -q -m "run: kiss sorcar $(date -u +%Y-%m-%dT%H:%MZ) [skip ci]"
+          for i in 1 2 3; do
+            git pull --rebase -q --autostash origin main && git push -q && break
+            echo "push attempt $i failed, retrying"; sleep 5
+          done
