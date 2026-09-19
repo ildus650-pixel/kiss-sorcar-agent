@@ -45,10 +45,26 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --quiet --upgrade pip
-          python -m pip install --quiet pipx
-          python -m pipx install kiss-agent-framework
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          "$HOME/.local/bin/sorcar" --help 2>&1 | head -20
+          # Plain pip rather than pipx: pipx's bin dir is not reliably on PATH in
+          # CI (first attempt died with exit 127 on ~/.local/bin/sorcar).
+          python -m pip install --quiet kiss-agent-framework
+
+          # Resolve the console script; fall back to calling main() directly
+          # (the module has no __main__ guard).
+          if command -v sorcar >/dev/null 2>&1; then
+            SORCAR="$(command -v sorcar)"
+          else
+            SCRIPTS="$(python -c 'import sysconfig;print(sysconfig.get_path("scripts"))')"
+            SORCAR="$SCRIPTS/sorcar"
+          fi
+          if [ ! -x "$SORCAR" ]; then
+            echo "::warning::sorcar console script not found; using module entry point"
+            SORCAR="__module__"
+          fi
+          echo "SORCAR=$SORCAR" >> "$GITHUB_ENV"
+          echo "::notice::sorcar binary: $SORCAR"
+          python -c "import kiss, kiss.agents.sorcar.sorcar_agent as m; print('kiss import OK, main:', callable(m.main))"
+          python -m pip show kiss-agent-framework | head -4
 
       - name: Run agent task
         env:
@@ -60,7 +76,12 @@ jobs:
           T="${TASK:-$DEFAULT_TASK}"
           echo "::notice::task: $T"
 
-          sorcar -m glm-4.5-flash --work-dir "$GITHUB_WORKSPACE" -t "$T" > /tmp/raw.txt 2>/tmp/err.txt
+          if [ "${SORCAR:-}" = "__module__" ]; then
+            python -c 'import sys;from kiss.agents.sorcar.sorcar_agent import main;sys.argv=["sorcar",*sys.argv[1:]];main()' \
+              -m glm-4.5-flash --work-dir "$GITHUB_WORKSPACE" -t "$T" > /tmp/raw.txt 2>/tmp/err.txt
+          else
+            "$SORCAR" -m glm-4.5-flash --work-dir "$GITHUB_WORKSPACE" -t "$T" > /tmp/raw.txt 2>/tmp/err.txt
+          fi
           rc=$?
           echo "sorcar_exit=$rc" | tee /tmp/exit.txt
           echo "::notice::sorcar exit code: $rc"
